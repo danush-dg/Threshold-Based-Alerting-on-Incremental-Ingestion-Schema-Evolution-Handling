@@ -1,189 +1,234 @@
-# 📊 Threshold-Based Alerting & Schema Evolution Handling Pipeline
+# 🚀 AWS Redshift ETL Pipeline with Schema Evolution & Monitoring
 
-## 🚀 Overview
-This project implements a resilient batch ingestion monitoring system that detects data spikes and schema changes. It ensures data reliability and self-healing pipelines using AWS services and SQL-based monitoring.
+## 📌 Overview
 
----
+This project implements a **production-style ETL pipeline** using:
 
-## 🎯 Objectives
-- Monitor daily ingestion volume  
-- Detect anomalies when: current_count > 5_day_avg × 1.10  
-- Trigger alerts automatically  
-- Detect schema changes (add/remove columns)  
-- Maintain schema history  
+* **AWS Lambda**
+* **Amazon Redshift**
+* **AWS Secrets Manager**
+* **Amazon CloudWatch**
+* **Amazon SNS**
 
----
+The pipeline supports:
 
-## ⚙️ Tech Stack
-AWS Services:
-- EventBridge Scheduler  
-- AWS Lambda  
-- Amazon Redshift Serverless  
-- CloudWatch (Metrics & Alarms)  
-- SNS (Notifications)  
-- Secrets Manager  
-
-Data Layer:
-- SQL (Redshift)  
-- Information Schema  
+* Incremental data loading
+* Schema evolution (add, drop, datatype changes)
+* Monitoring & anomaly detection
+* Automated alerting
 
 ---
 
-## 🧩 Architecture Flow
-1. EventBridge triggers Lambda daily  
-2. Lambda ingests incremental data  
-3. Control table updated  
-4. Rolling average computed  
-5. Threshold evaluated  
-6. CloudWatch metric published  
-7. Alarm triggers if needed  
-8. SNS sends notification  
-9. Schema changes detected  
+## 🏗️ Architecture
+
+```
+Source Table (source_sales)
+        ↓
+Staging Table (stg_sales)
+        ↓
+Operational Table (op_sales)
+        ↓
+Logging Table (logging_table)
+        ↓
+Monitoring Table (monitoring_table)
+        ↓
+CloudWatch Metrics → SNS Alerts
+```
 
 ---
 
-## 📂 Database Schema
+## ⚙️ Features
 
-### Source Table
+### ✅ 1. Incremental Load
+
+* Loads only new/updated records using `updated_at`
+* Controlled via `control_table`
+
+---
+
+### ✅ 2. Schema Evolution Handling
+
+Automatically detects and handles:
+
+#### ➤ New Columns
+
+* Adds to staging and operational tables
+
+#### ➤ Dropped Columns
+
+* Removes from staging and operational tables
+
+#### ➤ Datatype Changes
+
+* Uses safe migration approach:
+
+  * Add new column
+  * Copy data
+  * Drop old column
+  * Rename
+
+---
+
+### ✅ 3. Data Pipeline Flow
+
+1. Extract data from source
+2. Load into staging (truncate + insert)
+3. Upsert into operational table
+4. Update control table
+5. Log execution
+
+---
+
+### ✅ 4. Monitoring System
+
+#### 📊 Metrics Calculated:
+
+* Current rows processed
+* 5-day rolling average
+* Deviation percentage
+
+#### 🧠 Formula:
+
+```
+Deviation % = ((current - avg) / avg) * 100
+```
+
+---
+
+### ✅ 5. Alert Mechanism
+
+Alerts are triggered when:
+
+```
+current_rows > avg_last_5_days * 1.10
+OR
+schema_change == 'Yes'
+```
+
+---
+
+### 🔔 Alert Channels:
+
+* Amazon SNS (Email / Notification)
+
+---
+
+### 📈 CloudWatch Metrics:
+
+* `RowsProcessed`
+
+---
+
+## 🗄️ Required Tables
+
+### 1. Control Table
+
+Tracks pipeline metadata
+
+### 2. Logging Table
+
+Stores execution logs
+
+### 3. Monitoring Table
+
 ```sql
-CREATE TABLE source_sales (
-    sale_id INT,
-    product_name VARCHAR(100),
-    quantity INT,
-    price DECIMAL(10,2),
-    sale_date DATE
-);
-
-Control Table
-CREATE TABLE control_table (
-    run_date DATE,
-    rows_loaded INT,
-    status VARCHAR(20),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-Monitoring Table
 CREATE TABLE monitoring_table (
-    run_date DATE,
-    current_count INT,
-    avg_last_5_days FLOAT,
-    deviation_percent FLOAT
+    id INT IDENTITY(1,1),
+    current_rows INT,
+    avg_rows FLOAT,
+    deviation_percent FLOAT,
+    created_at TIMESTAMP DEFAULT GETDATE()
 );
-Alerts Table
-CREATE TABLE alerts_table (
-    alert_id INT IDENTITY(1,1),
-    run_date DATE,
-    message VARCHAR(500),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-Schema History Table
-CREATE TABLE schema_history (
-    version_id INT IDENTITY(1,1),
-    table_name VARCHAR(100),
-    schema_definition VARCHAR(1000),
-    change_detected_at TIMESTAMP
-);
-🔄 Pipeline Phases
-Phase 1 — Source Setup
+```
 
-Create source table
+---
 
-Insert sample data
+## 🔐 Secrets Manager
 
-Phase 2 — Monitoring Setup
+Stores Redshift credentials:
 
-Create control, monitoring, alerts, schema tables
+```json
+{
+  "host": "...",
+  "username": "...",
+  "password": "...",
+  "database": "..."
+}
+```
 
-Phase 3 — Secure Access
+---
 
-Store credentials in Secrets Manager
+## ☁️ AWS Permissions Required
 
-IAM Role: LambdaIngestionRole
+IAM Role must include:
 
-Phase 4 — Daily Ingestion
-SELECT COUNT(*)
-FROM source_sales
-WHERE sale_date = CURRENT_DATE;
-Phase 5 — Rolling Average
-SELECT AVG(rows_loaded)
-FROM control_table
-WHERE run_date >= CURRENT_DATE - INTERVAL '5 day';
-Phase 6 — Threshold Detection
+* `secretsmanager:GetSecretValue`
+* `cloudwatch:PutMetricData`
+* `sns:Publish`
 
-Condition:
+---
 
-current_count > avg_last_5_days * 1.10
-Phase 7 — CloudWatch Monitoring
+## 🚀 Lambda Execution Flow
 
-Publish metric: IngestionSpike = 1
+1. Fetch credentials from Secrets Manager
+2. Run ETL pipeline
+3. Compute rolling average & deviation
+4. Store metrics in monitoring table
+5. Push CloudWatch metric
+6. Trigger SNS alert if condition met
+7. Print final summary
 
-Phase 8 — Notification (SNS)
+---
 
-Email/SNS alert triggered
+## 📊 Sample Output
 
-Phase 9 — Schema Evolution
-SELECT column_name
-FROM information_schema.columns
-WHERE table_name = 'source_sales';
-Phase 10 — Scheduling
+```
+========== ETL SUMMARY ==========
+Total Rows Processed : 15
+Current Rows         : 15
+5-Day Avg            : 10
+Deviation (%)        : 50.00
+Schema Change        : Yes
+Alert Triggered      : Yes
+Status               : SUCCESS
+================================
+```
 
-EventBridge schedule: rate(1 day)
+---
 
-🧠 Lambda Logic
+## 🧪 Use Cases
 
-Retrieve credentials
+* Incremental ETL pipelines
+* Schema drift handling
+* Data quality monitoring
+* Anomaly detection
+* Real-time alerting
 
-Count rows
+---
 
-Compute average
+## 🔥 Future Enhancements
 
-Calculate deviation
+* CloudWatch Dashboard visualization
+* Multi-level alert severity
+* Data quality checks (nulls, duplicates)
+* Partition-based loading
+* Integration with S3 / Kinesis
 
-Store metrics
+---
 
-Check threshold
+## 👨‍💻 Author
 
-Publish metric
+Danush
 
-Detect schema change
+---
 
-Log schema updates
+## 📌 Summary
 
-🧪 Testing
-Threshold Spike Test
-INSERT INTO source_sales VALUES
-(1001,'Laptop',1,900,CURRENT_DATE),
-(1002,'Mouse',2,40,CURRENT_DATE),
-(1003,'Keyboard',1,80,CURRENT_DATE),
-(1004,'Monitor',1,300,CURRENT_DATE),
-(1005,'Tablet',2,400,CURRENT_DATE),
-(1006,'Phone',3,700,CURRENT_DATE),
-(1007,'Speaker',1,120,CURRENT_DATE),
-(1008,'Camera',1,500,CURRENT_DATE);
+This project demonstrates a **real-world ETL system** with:
 
-Expected:
+✔ Schema evolution
+✔ Incremental ingestion
+✔ Monitoring & anomaly detection
+✔ Alerting via AWS
 
-Alert triggered
-
-Entry in alerts_table
-
-Schema Evolution Test
-ALTER TABLE source_sales
-ADD COLUMN region VARCHAR(50);
-
-Expected:
-
-Schema change detected
-
-Entry in schema_history
-
-✅ Outcome
-
-Automated ingestion monitoring
-
-Real-time anomaly detection
-
-Schema evolution handling
-
-Alerting via CloudWatch + SNS
-
-Reliable and scalable pipeline
+A strong foundation for **production-grade data pipelines**.
