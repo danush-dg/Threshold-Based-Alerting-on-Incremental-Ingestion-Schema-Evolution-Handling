@@ -1,196 +1,330 @@
 import json
 import boto3
 import psycopg2
+import logging
 
+# =========================
+# AWS CLIENTS
+# =========================
 secrets_client = boto3.client('secretsmanager')
 cloudwatch = boto3.client('cloudwatch')
 sns = boto3.client('sns')
 
-SNS_TOPIC = "arn:aws:sns:ap-south-1:104487794852:ingestion-alerts"
+SNS_TOPIC = " "
+SECRET_NAME = "redshiftcredential"
+
+_cached_creds = None
+
+# =========================
+# LOGGING
+# =========================
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 
+# =========================
+# GET CREDS
+# =========================
 def get_db_credentials():
-    print("Fetching DB credentials from Secrets Manager")
+    global _cached_creds
 
-    secret = secrets_client.get_secret_value(
-        SecretId="redshift-key"
+    if _cached_creds:
+        return _cached_creds
+
+    logger.info("Fetching credentials from Secrets Manager")
+
+    response = secrets_client.get_secret_value(SecretId=SECRET_NAME)
+    secret = json.loads(response['SecretString'])
+
+    _cached_creds = {
+        "host": secret['host'],
+        "user": secret['username'],
+        "password": secret['password'],
+        "database": secret['database'],
+        "port": 5439
+    }
+
+    return _cached_creds
+
+
+# =========================
+# CLOUDWATCH METRICS
+# =========================
+def push_metrics(total_rows):
+    cloudwatch.put_metric_data(
+        Namespace='ETLMonitoring',
+        MetricData=[
+            {
+                'MetricName': 'RowsProcessed',
+                'Value': total_rows,
+                'Unit': 'Count'
+            }
+        ]
     )
 
-    creds = json.loads(secret['SecretString'])
 
-    print("Credentials retrieved successfully")
-
-    return creds
-
-
-def lambda_handler(event, context):
-
-    print("=== PIPELINE STARTED ===")
-
-    creds = get_db_credentials()
-
-    print("Connecting to Redshift...")
-
-    conn = psycopg2.connect(
-        host=creds['host'],
-        user=creds['username'],
-        password=creds['password'],
-        database=creds['database'],
-        port=creds['port']
-    )
-
-    print("Connection established")
-
-    cursor = conn.cursor()
-
-    # STEP 1 Count today's records
-    print("\nSTEP 1: Counting today's records")
+# =========================
+# METRICS + MONITORING
+# =========================
+def compute_and_store_metrics(cursor):
 
     cursor.execute("""
-        SELECT COUNT(*)
-        FROM source_sales
-        WHERE sale_date = CURRENT_DATE
-    """)
-
-    current_count = cursor.fetchone()[0]
-
-    print(f"Rows ingested today: {current_count}")
-
-    # STEP 2 Calculate rolling average
-    print("\nSTEP 2: Calculating 5-day rolling average")
-
-    cursor.execute("""
-        SELECT COALESCE(AVG(rows_loaded),0)
-        FROM control_table
-        WHERE run_date >= CURRENT_DATE - INTERVAL '5 day'
-    """)
-
-    avg_last5 = cursor.fetchone()[0]
-
-    if avg_last5 == 0:
-        avg_last5 = current_count if current_count != 0 else 1
-
-    print(f"Rolling average (last 5 days): {avg_last5}")
-
-    # STEP 3 Calculate deviation
-    deviation = ((current_count - avg_last5) / avg_last5) * 100
-
-    print(f"Deviation from rolling average: {deviation:.2f}%")
-
-    # STEP 4 Update control table
-    print("\nSTEP 3: Updating control table")
-
-    cursor.execute("""
-        INSERT INTO control_table(run_date, rows_loaded, status)
-        VALUES (CURRENT_DATE, %s, 'SUCCESS')
-    """, (current_count,))
-
-    print("Control table updated")
-
-    # STEP 5 Insert monitoring metrics
-    print("\nSTEP 4: Inserting monitoring metrics")
-
-    cursor.execute("""
-        INSERT INTO monitoring_table
-        VALUES (CURRENT_DATE,%s,%s,%s)
-    """,(current_count,avg_last5,deviation))
-
-    print("Monitoring table updated")
-
-    # STEP 6 Threshold check
-    print("\nSTEP 5: Checking threshold condition")
-
-    threshold_triggered = False
-
-    if current_count > avg_last5 * 1.10:
-
-        threshold_triggered = True
-
-        print("ALERT: Threshold exceeded")
-
-        cursor.execute("""
-            INSERT INTO alerts_table(run_date,message)
-            VALUES (CURRENT_DATE,'Row spike detected')
-        """)
-
-        cloudwatch.put_metric_data(
-            Namespace='IngestionMonitoring',
-            MetricData=[
-                {
-                    'MetricName':'IngestionSpike',
-                    'Value':1,
-                    'Unit':'Count'
-                }
-            ]
-        )
-
-        sns.publish(
-            TopicArn=SNS_TOPIC,
-            Message="Data spike detected in ingestion pipeline"
-        )
-
-        print("Alert stored, CloudWatch metric sent, SNS notification triggered")
-
-    else:
-        print("No threshold breach detected")
-
-    # STEP 7 Schema evolution detection
-    print("\nSTEP 6: Checking schema evolution")
-
-    cursor.execute("""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_name='source_sales'
-        ORDER BY ordinal_position
-    """)
-
-    schema = ",".join([r[0] for r in cursor.fetchall()])
-
-    print(f"Current schema: {schema}")
-
-    cursor.execute("""
-        SELECT schema_definition
-        FROM schema_history
-        ORDER BY version_id DESC
+        SELECT row_loaded, stg_tablename, schema_change
+        FROM logging_table
+        ORDER BY id DESC
         LIMIT 1
     """)
+    latest = cursor.fetchone()
 
-    last_schema = cursor.fetchone()
+    if not latest:
+        return 0, 0, 0, 'No'
 
-    schema_changed = False
+    current, stg, schema_change = latest
 
-    if not last_schema or last_schema[0] != schema:
+    # rolling avg
+    cursor.execute("""
+        SELECT AVG(row_loaded)
+        FROM logging_table
+        WHERE stg_tablename = %s
+        AND last_loaded >= GETDATE() - INTERVAL '5 days'
+        AND status = 'Success'
+    """, (stg,))
 
-        schema_changed = True
+    avg = cursor.fetchone()[0] or 0
 
-        cursor.execute("""
-            INSERT INTO schema_history (table_name, schema_definition, change_detected_at)
-            VALUES (%s,%s,CURRENT_TIMESTAMP)
-        """, ("source_sales", schema))
+    deviation = ((current - avg) / avg * 100) if avg > 0 else 0
 
-        print("SCHEMA CHANGE DETECTED - new version logged")
+    # store monitoring
+    cursor.execute("""
+        INSERT INTO monitoring_table
+        (current_rows, avg_rows, deviation_percent, created_at)
+        VALUES (%s, %s, %s, GETDATE())
+    """, (current, avg, deviation))
 
-    else:
-        print("No schema changes detected")
+    return current, avg, deviation, schema_change
 
-    conn.commit()
 
-    cursor.close()
-    conn.close()
+# =========================
+# ETL PIPELINE
+# =========================
+class RedshiftETLPipeline:
 
-    print("\n=== PIPELINE COMPLETED ===")
+    def __init__(self, config):
+        self.config = config
+        self.conn = None
+        self.cursor = None
 
-    print(f"""
-FINAL RESULT SUMMARY
----------------------
-Rows Ingested Today : {current_count}
-Rolling Avg (5 days): {avg_last5}
-Deviation (%)       : {deviation:.2f}
-Threshold Triggered : {threshold_triggered}
-Schema Changed      : {schema_changed}
-""")
+    def connect(self):
+        if not self.conn:
+            logger.info("Connecting to Redshift")
+            self.conn = psycopg2.connect(**self.config)
+            self.cursor = self.conn.cursor()
 
-    return {
-        "statusCode":200,
-        "body":"Pipeline executed successfully"
-    }
+    def disconnect(self):
+        if self.conn:
+            self.cursor.close()
+            self.conn.close()
+            self.conn = None
+
+    def execute_query(self, query, params=None, fetch=False):
+        try:
+            self.cursor.execute(query, params)
+
+            if fetch:
+                cols = [desc[0] for desc in self.cursor.description]
+                return [dict(zip(cols, row)) for row in self.cursor.fetchall()]
+
+            self.conn.commit()
+
+        except Exception as e:
+            self.conn.rollback()
+            logger.error(f"Query failed: {e}")
+            raise
+
+    # =========================
+    # SCHEMA HANDLING
+    # =========================
+    def get_columns(self, table):
+        result = self.execute_query("""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_name = %s
+        """, (table,), fetch=True)
+
+        return {r['column_name']: r['data_type'] for r in result}
+
+    def check_and_update_schema(self, src, stg, op):
+
+        schema_changed = False
+        source_cols = self.get_columns(src)
+        staging_cols = self.get_columns(stg)
+
+        # NEW
+        for col in set(source_cols) - set(staging_cols):
+            schema_changed = True
+            dtype = source_cols[col]
+            self.execute_query(f"ALTER TABLE {stg} ADD COLUMN {col} {dtype}")
+            self.execute_query(f"ALTER TABLE {op} ADD COLUMN {col} {dtype}")
+
+        # DROPPED
+        for col in set(staging_cols) - set(source_cols):
+            schema_changed = True
+            self.execute_query(f"ALTER TABLE {stg} DROP COLUMN {col}")
+            self.execute_query(f"ALTER TABLE {op} DROP COLUMN {col}")
+
+        # DATATYPE (basic)
+        for col in source_cols:
+            if col in staging_cols and source_cols[col] != staging_cols[col]:
+                schema_changed = True
+                dtype = source_cols[col]
+
+                self.execute_query(f"ALTER TABLE {stg} ADD COLUMN {col}_new {dtype}")
+                self.execute_query(f"UPDATE {stg} SET {col}_new = {col}")
+                self.execute_query(f"ALTER TABLE {stg} DROP COLUMN {col}")
+                self.execute_query(f"ALTER TABLE {stg} RENAME COLUMN {col}_new TO {col}")
+
+                self.execute_query(f"ALTER TABLE {op} ADD COLUMN {col}_new {dtype}")
+                self.execute_query(f"UPDATE {op} SET {col}_new = {col}")
+                self.execute_query(f"ALTER TABLE {op} DROP COLUMN {col}")
+                self.execute_query(f"ALTER TABLE {op} RENAME COLUMN {col}_new TO {col}")
+
+        return 'Yes' if schema_changed else 'No'
+
+    # =========================
+    # DATA FLOW
+    # =========================
+    def extract(self, table, last_loaded):
+        return self.execute_query(
+            f"SELECT * FROM {table} WHERE updated_at >= %s",
+            (last_loaded,),
+            fetch=True
+        )
+
+    def load_staging(self, stg, data):
+        if not data:
+            return 0
+
+        self.execute_query(f"TRUNCATE {stg}")
+
+        cols = list(data[0].keys())
+        col_str = ','.join(cols)
+        placeholders = ','.join(['%s'] * len(cols))
+
+        for row in data:
+            self.execute_query(
+                f"INSERT INTO {stg} ({col_str}) VALUES ({placeholders})",
+                tuple(row.values())
+            )
+
+        return len(data)
+
+    def upsert(self, op, stg):
+
+        cols = list(self.get_columns(stg).keys())
+        col_str = ','.join(cols)
+
+        self.execute_query(f"""
+            DELETE FROM {op}
+            WHERE id IN (SELECT id FROM {stg})
+        """)
+
+        self.execute_query(f"""
+            INSERT INTO {op} ({col_str})
+            SELECT {col_str} FROM {stg}
+        """)
+
+    def update_control(self, src):
+        self.execute_query(
+            "UPDATE control_table SET last_loaded = GETDATE() WHERE source_table = %s",
+            (src,)
+        )
+
+    def log(self, stg, count, status, schema_change):
+        self.execute_query("""
+            INSERT INTO logging_table
+            (alert, last_loaded, stg_tablename, row_loaded, status, schema_change)
+            VALUES (%s, GETDATE(), %s, %s, %s, %s)
+        """, ('No', stg, count, status, schema_change))
+
+    def run(self):
+        self.connect()
+        total = 0
+
+        for cfg in self.execute_query("SELECT * FROM control_table", fetch=True):
+
+            schema = self.check_and_update_schema(
+                cfg['source_table'],
+                cfg['staging_table'],
+                cfg['operational_table']
+            )
+
+            data = self.extract(cfg['source_table'], cfg['last_loaded'])
+            count = self.load_staging(cfg['staging_table'], data)
+
+            total += count
+
+            if count:
+                self.upsert(cfg['operational_table'], cfg['staging_table'])
+                self.update_control(cfg['source_table'])
+
+            self.log(cfg['staging_table'], count, 'Success', schema)
+
+        self.disconnect()
+        return total
+
+
+# =========================
+# LAMBDA HANDLER
+# =========================
+def lambda_handler(event, context):
+
+    logger.info("Lambda started")
+
+    try:
+        creds = get_db_credentials()
+        etl = RedshiftETLPipeline(creds)
+
+        total = etl.run()
+
+        etl.connect()
+        current, avg, deviation, schema_change = compute_and_store_metrics(etl.cursor)
+
+        push_metrics(total)
+
+        alert_flag = 'No'
+
+        if current > avg * 1.10 or schema_change == 'Yes':
+            sns.publish(
+                TopicArn=SNS_TOPIC,
+                Message=f"""
+🚨 ETL ALERT
+
+Current Rows   : {current}
+5-Day Avg      : {avg}
+Deviation (%)  : {deviation:.2f}
+Schema Changed : {schema_change}
+""",
+                Subject="ETL Alert"
+            )
+            alert_flag = 'Yes'
+
+        summary = f"""
+========== ETL SUMMARY ==========
+Total Rows Processed : {total}
+Current Rows         : {current}
+5-Day Avg            : {avg}
+Deviation (%)        : {deviation:.2f}
+Schema Change        : {schema_change}
+Alert Triggered      : {alert_flag}
+Status               : SUCCESS
+================================
+"""
+
+        print(summary)
+        logger.info(summary)
+
+        return {"statusCode": 200}
+
+    except Exception as e:
+        logger.error(str(e))
+        return {"statusCode": 500}
