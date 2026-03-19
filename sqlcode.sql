@@ -1,106 +1,103 @@
-CREATE TABLE source_sales (
-sale_id INT,
-product_name VARCHAR(100),
-quantity INT,
-price DECIMAL(10,2),
-sale_date DATE
-);
-INSERT INTO source_sales VALUES
-(1,'Laptop',2,800.00,'2024-01-01'),
-(2,'Mouse',5,20.00,'2024-01-01'),
-(3,'Keyboard',3,50.00,'2024-01-02'),
-(4,'Monitor',1,300.00,'2024-01-02');
+CREATE DATABASE db;
+USE db;
 
-CREATE TABLE control_table (
-run_date DATE,
-rows_loaded INT,
-status VARCHAR(20),
-created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+-- 1. Source Table
+CREATE TABLE IF NOT EXISTS source_sales (
+    id INT PRIMARY KEY, name VARCHAR(100),
+    amount DECIMAL(10, 2), updated_at DATETIME);
+
+-- 2. Staging Table (Includes ETL metadata + Source columns)
+CREATE TABLE IF NOT EXISTS stg_sales (
+    id INT, name VARCHAR(100),
+    amount DECIMAL(10, 2), updated_at DATETIME
 );
 
-CREATE TABLE monitoring_table (
-run_date DATE,
-current_count INT,
-avg_last_5_days FLOAT,
-deviation_percent FLOAT
+-- 3. Operational Table (Target)
+CREATE TABLE IF NOT EXISTS op_sales (
+    id INT PRIMARY KEY, name VARCHAR(100),
+    amount DECIMAL(10, 2), updated_at DATETIME );
+
+-- 4. Control Table (Metadata)
+CREATE TABLE IF NOT EXISTS control_table (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    source VARCHAR(50), source_table VARCHAR(100),
+    staging_table VARCHAR(100), operational_table VARCHAR(100),
+    ingestion_type VARCHAR(50), last_loaded DATETIME,
+    primary_key_col VARCHAR(50) 
 );
 
-CREATE TABLE alerts_table (
-alert_id INT IDENTITY(1,1),
-run_date DATE,
-message VARCHAR(500),
-created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE schema_history (
-version_id INT IDENTITY(1,1),
-table_name VARCHAR(100),
-schema_definition VARCHAR(1000),
-change_detected_at TIMESTAMP
+-- 5. Logging Table
+CREATE TABLE IF NOT EXISTS logging_table (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    alert VARCHAR(5), -- 'Yes' or 'No'
+    last_loaded DATETIME,
+    stg_tablename VARCHAR(100),
+    row_loaded INT,
+    status VARCHAR(20), 
+    schema_change VARCHAR(5) 
 );
 
 
-INSERT INTO control_table VALUES
-('2026-03-12', 10, 'SUCCESS', CURRENT_TIMESTAMP),
-('2026-03-13', 12, 'SUCCESS', CURRENT_TIMESTAMP),
-('2026-03-14', 11, 'SUCCESS', CURRENT_TIMESTAMP),
-('2026-03-15', 9, 'SUCCESS', CURRENT_TIMESTAMP),
-('2026-03-16', 10, 'SUCCESS', CURRENT_TIMESTAMP);
+INSERT INTO control_table 
+(source, source_table, staging_table, operational_table, ingestion_type, last_loaded, primary_key_col)
+VALUES 
+('mysql', 'source_sales', 'stg_sales', 'op_sales', 'incremental', now() - interval 2 day, 'id');
+
+-- Insert initial data into source_sales
+INSERT INTO source_sales (id, name, amount, updated_at) VALUES
+(1, 'Laptop', 40000.00, '2026-03-18 09:01:00'),
+(2, 'Keyboard', 900.00,'2026-03-18 09:19:00'),
+(3, 'Power Bank', 1500.00,'2026-03-18 09:40:00');
+
+INSERT INTO source_sales (id, name, amount, updated_at) VALUES
+(4, 'Smartphone', 20000.00, now()),
+(5, 'Mouse', 800.00, now()),
+(6, 'Monitor', 15000.00, now()),
+(7, 'Tablet', 12000.00, now());
+
+INSERT INTO source_sales (id, name, amount, updated_at) VALUES
+(8, 'USB Cable', 300.00, NOW()),
+(9, 'Speaker', 2500.00, NOW()),
+(10, 'Router', 3500.00, NOW()),
+(11, 'SSD', 5000.00, NOW()),
+(12, 'Projector', 30000.50, NOW()),
+(13, 'Projector', 30000.50, NOW()),
+(14, 'TV', 60000, NOW()),
+(15, 'AC', 50000, NOW()),
+(16, 'Fridge', 45000, NOW()),
+(17, 'Washing Machine', 30000, NOW()),
+(18, 'Microwave', 15000, NOW());
 
 
-INSERT INTO source_sales VALUES
-(1001,'Laptop',1,900,CURRENT_DATE),
-(1002,'Mouse',2,40,CURRENT_DATE),
-(1003,'Keyboard',1,80,CURRENT_DATE),
-(1004,'Monitor',1,300,CURRENT_DATE),
-(1005,'Tablet',2,400,CURRENT_DATE);
+-- schema evolution
 
-INSERT INTO source_sales VALUES
-(1006,'Phone',3,700,CURRENT_DATE),
-(1007,'Speaker',1,120,CURRENT_DATE),
-(1008,'Camera',1,500,CURRENT_DATE),
-(1009,'Printer',1,200,CURRENT_DATE),
-(1010,'Router',1,150,CURRENT_DATE);
-
-INSERT INTO source_sales VALUES
-(1011,'SSD',1,180,CURRENT_DATE),
-(1012,'RAM',2,220,CURRENT_DATE);
-
-SELECT *
-FROM schema_history
-ORDER BY version_id;
-
-SELECT column_name
-FROM information_schema.columns
-WHERE table_name='source_sales'
-ORDER BY ordinal_position;
-
-ALTER TABLE source_sales
-ADD COLUMN region VARCHAR(50);
-
-SELECT column_name
-FROM information_schema.columns
-WHERE table_name='source_sales'
-ORDER BY ordinal_position;
-
-INSERT INTO source_sales
-VALUES (2001,'Laptop',1,900,CURRENT_DATE,'South');
+-- data type change on amount column
+ALTER TABLE source_sales MODIFY COLUMN amount int;
+INSERT INTO source_sales (id, name, amount, updated_at) VALUES
+(19, 'Scanner', 12000.50, NOW());
+ALTER TABLE source_sales MODIFY COLUMN amount decimal(10,2);
 
 
-INSERT INTO source_sales VALUES
-(5001,'Laptop',1,900,CURRENT_DATE),
-(5002,'Mouse',2,40,CURRENT_DATE),
-(5003,'Keyboard',1,80,CURRENT_DATE),
-(5004,'Monitor',1,300,CURRENT_DATE),
-(5005,'Tablet',2,400,CURRENT_DATE),
-(5006,'Phone',3,700,CURRENT_DATE),
-(5007,'Speaker',1,120,CURRENT_DATE),
-(5008,'Camera',1,500,CURRENT_DATE),
-(5009,'Printer',1,200,CURRENT_DATE),
-(5010,'Router',1,150,CURRENT_DATE),
-(5011,'SSD',1,180,CURRENT_DATE),
-(5012,'RAM',2,220,CURRENT_DATE);
+-- adding a column - category to source_sales table
+ALTER TABLE source_sales ADD COLUMN category VARCHAR(50);
+UPDATE source_sales SET category = 'Electronics', updated_at = NOW() WHERE id = 1;
+UPDATE source_sales SET category = 'Electronics', updated_at = NOW() WHERE id = 2;
 
 
+-- Final select to verify all data
+SELECT * FROM source_sales;
+SELECT * FROM stg_sales;
+SELECT * FROM op_sales;
+SELECT * FROM logging_table;
+select * from control_table;
 
+-- Drop category column from all tables (maintaining consistency)
+ALTER TABLE source_sales DROP COLUMN category;
+ALTER TABLE stg_sales DROP COLUMN category;
+ALTER TABLE op_sales DROP COLUMN category;
 
+truncate source_sales;
+truncate stg_sales;
+truncate logging_table;
+truncate op_sales;
+truncate control_table;
